@@ -24,6 +24,9 @@
 #include <unistd.h>
 #include "draw.h"
 #include "doc.h"
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <limits.h>
 
 #define MIN(a, b)	((a) < (b) ? (a) : (b))
 #define MAX(a, b)	((a) > (b) ? (a) : (b))
@@ -33,6 +36,8 @@
 #define MARGIN		1
 #define CTRLKEY(x)	((x) - 96)
 #define ISMARK(x)	(isalpha(x) || (x) == '\'' || (x) == '`')
+
+#define SOCK_PATH	"/tmp/fbpdf.sock"
 
 static struct doc *doc;
 static fbval_t *pbuf;		/* current page */
@@ -52,6 +57,14 @@ static int zoom_def = 150;	/* default zoom */
 static int rotate;
 static int count;
 static int invert;		/* invert colors? */
+
+static int sock_descriptor = -1;
+static struct sockaddr_un sock_addr;
+static int max_fd = -1;
+static fd_set select_fds;
+static fd_set tmp_fds;
+struct timeval tv;
+
 
 static void draw(void)
 {
@@ -122,9 +135,24 @@ static void jmpmark(int c, int offset)
 static int readkey(void)
 {
 	unsigned char b;
-	if (read(0, &b, 1) <= 0)
+
+	tmp_fds = select_fds;
+
+	tv.tv_sec = INT_MAX;
+	tv.tv_usec = 0;
+	
+	if(select(max_fd + 1, &tmp_fds, NULL, NULL, &tv)){
+		for(int cur_fd = 0; cur_fd <= max_fd; cur_fd++){
+			if(FD_ISSET(cur_fd, &tmp_fds)){
+				if (read(cur_fd, &b, 1) <= 0)
+					return -1;
+				//printf("read %c\n", b);
+				return b;
+			}
+		}
+	}else{
 		return -1;
-	return b;
+	}
 }
 
 static int getcount(int def)
@@ -206,6 +234,39 @@ static int lmargin(void)
 	}
 	return ret;
 }
+
+
+static int setup_socket()
+{
+	memset(&sock_addr, 0, sizeof(sock_addr));
+	sock_addr.sun_family = AF_UNIX;
+	strncpy(sock_addr.sun_path, SOCK_PATH, strlen(SOCK_PATH)+1);
+
+	sock_descriptor = socket(AF_UNIX, SOCK_STREAM, 0);
+	if(sock_descriptor < 0){
+		return 1;
+	}
+	if(bind(sock_descriptor, (struct sockaddr *)&sock_addr, sizeof(sock_addr))){
+		return 1;
+	}
+	if(listen(sock_descriptor, 0)){
+		return 1;
+	}
+
+	FD_ZERO(&select_fds);
+	FD_SET(sock_descriptor, &select_fds);
+	FD_SET(0, &select_fds);
+	if(sock_descriptor > max_fd){
+		max_fd = sock_descriptor;
+	}
+
+	return 0;
+}
+
+static void close_socket(){
+	unlink(SOCK_PATH);
+}
+
 
 static void mainloop(void)
 {
@@ -390,7 +451,11 @@ int main(int argc, char *argv[])
 	if (FBM_BPP(fb_mode()) != sizeof(fbval_t))
 		fprintf(stderr, "fbpdf: fbval_t doesn't match fb depth\n");
 	else
+	{
+		setup_socket();
 		mainloop();
+		close_socket();
+	}
 	fb_free();
 	free(pbuf);
 	if (doc)
